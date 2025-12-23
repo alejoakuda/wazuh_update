@@ -359,7 +359,9 @@ upgrade_agents() {
     local READY=false
 
     while [ $RETRIES -lt $MAX_RETRIES ]; do
-        if docker exec "$MASTER_ID" /var/ossec/bin/wazuh-control status 2>&1 | grep -q "wazuh-modulesd is running"; then
+        # 1. Obtenemos la salida y eliminamos posibles caracteres de control/colores con sed
+        # 2. Buscamos 'wazuh-modulesd' seguido de 'running' sin importar lo que haya en medio
+        if docker exec "$MASTER_ID" /var/ossec/bin/wazuh-control status 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -qi "wazuh-modulesd.*running"; then
             READY=true
             break
         fi
