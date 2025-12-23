@@ -342,54 +342,67 @@ cleanup_old_images() {
 # EJECUCIÓN PRINCIPAL
 
 upgrade_agents() {
+    local MANUAL_ID="${1:-}" 
+    echo "----------------------------------------------------------------"
     log_info "Iniciando proceso de actualización de agentes..."
     
-    # 1. Buscar el contenedor Master
+    # 1. Obtener ID del Master
     local MASTER_ID=$(docker ps --filter "name=wazuh.master" -q | head -n 1)
-
     if [ -z "$MASTER_ID" ]; then
-        log_error "Contenedor 'wazuh.master' no detectado. ¿Están los servicios activos?"
+        log_error "ERROR: No se encontró el contenedor Master."
         exit 1
     fi
 
-    # 2. Verificación de Salud del Servicio (Security Check)
-    log_info "Verificando que el Manager esté listo para gestionar upgrades..."
-    local RETRIES=0
-    local MAX_RETRIES=12
-    local READY=false
-
-    while [ $RETRIES -lt $MAX_RETRIES ]; do
-        # 1. Obtenemos la salida y eliminamos posibles caracteres de control/colores con sed
-        # 2. Buscamos 'wazuh-modulesd' seguido de 'running' sin importar lo que haya en medio
-        if docker exec "$MASTER_ID" /var/ossec/bin/wazuh-control status 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -qi "wazuh-modulesd.*running"; then
-            READY=true
-            break
-        fi
-        log_info "  [i] Esperando al servicio (Intento $((RETRIES+1))/$MAX_RETRIES)..."
-        sleep 10
-        RETRIES=$((RETRIES + 1))
-    done
-
-    if [ "$READY" = false ]; then
-        log_error "El servicio Wazuh no respondió a tiempo. Revisa los logs del contenedor master."
-        exit 1
-    fi
-
-    # 3. Listado y actualización
-    log_info "Consultando agentes que requieren actualización..."
-    local PENDING_IDS=$(docker exec "$MASTER_ID" /var/ossec/bin/agent_upgrade -l 2>/dev/null | grep "ID:" | awk '{print $2}' | sed 's/,//g' || true)
-
-    if [ -z "$PENDING_IDS" ]; then
-        log_info "✅ Todos los agentes están en la última versión disponible."
+    # 2. Reinicio preventivo de authd para evitar 'lock errors'
+    log_info "Optimizando Manager: Reiniciando wazuh-authd para limpiar bloqueos..."
+    if docker exec "$MASTER_ID" /var/ossec/bin/wazuh-control restart wazuh-authd > /dev/null 2>&1; then
+        log_info "   [+] Servicio authd reiniciado. Esperando 5s para estabilidad..."
+        sleep 5
     else
-        log_warn "Agentes pendientes detectados: $(echo $PENDING_IDS | tr '\n' ' ')"
-        for AGENT_ID in $PENDING_IDS; do
-            log_info "Actualizando Agente ID: $AGENT_ID..."
-            docker exec "$MASTER_ID" /var/ossec/bin/agent_upgrade -a "$AGENT_ID" > /dev/null 2>&1 || \
-            log_warn "Agente $AGENT_ID no disponible para upgrade."
-        done
-        log_info "✓ Tarea de agentes finalizada."
+        log_warn "   [!] No se pudo reiniciar authd, continuando de todos modos..."
     fi
+
+    echo "----------------------------------------------------------------"
+
+    # 3. Lógica de selección de agentes
+    local AGENTS_TO_UPGRADE=""
+    if [ -n "$MANUAL_ID" ]; then
+        log_info "Modo MANUAL: Forzando upgrade para el Agente ID: $MANUAL_ID"
+        AGENTS_TO_UPGRADE="$MANUAL_ID"
+    else
+        log_info "Modo AUTOMÁTICO: Escaneando tabla de agentes desactualizados..."
+        AGENTS_TO_UPGRADE=$(docker exec "$MASTER_ID" /var/ossec/bin/agent_upgrade -l 2>/dev/null | awk '$1 ~ /^[0-9]+$/ {print $1}' || true)
+    fi
+
+    # 4. Procesamiento
+    if [ -z "$AGENTS_TO_UPGRADE" ]; then
+        log_info "✅ No se encontraron agentes que requieran actualización."
+    else
+        echo "----------------------------------------------------------------"
+        for AGENT_ID in $AGENTS_TO_UPGRADE; do
+            log_info ">> Lanzando upgrade al Agente: $AGENT_ID..."
+            
+            # Ejecución del upgrade
+            if docker exec "$MASTER_ID" /var/ossec/bin/agent_upgrade -a "$AGENT_ID" > /dev/null 2>&1; then
+                log_info "   [+] Comando enviado. Revisa el estado en el dashboard."
+            else
+                log_warn "   [!] Error al enviar el comando al ID $AGENT_ID."
+            fi
+        done
+        echo "----------------------------------------------------------------"
+
+        # 5. Verificación Final
+        log_info "Sincronizando y verificando lista final..."
+        sleep 3
+        local REMAINING=$(docker exec "$MASTER_ID" /var/ossec/bin/agent_upgrade -l 2>/dev/null | awk '$1 ~ /^[0-9]+$/ {count++} END {print count+0}')
+        
+        if [ "$REMAINING" -eq 0 ]; then
+            log_info "✓ Verificación exitosa: Todos los agentes procesados."
+        else
+            log_warn "Estado: Aún quedan $REMAINING agentes en la lista (esto es normal si el upgrade está en curso)."
+        fi
+    fi
+    echo "----------------------------------------------------------------"
 }
 
 show_help() {
@@ -404,10 +417,14 @@ show_help() {
 main() {
 
     local AGENT_ONLY=false
+    local SPECIFIC_AGENT_ID=""
     
     while getopts "ah" opt; do
         case $opt in
-            a) AGENT_ONLY=true ;;
+            a) 
+            AGENT_ONLY=true 
+            SPECIFIC_AGENT_ID="$OPTARG" 
+            ;;
             h) show_help; exit 0 ;;
             *) show_help; exit 1 ;;
         esac
